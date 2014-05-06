@@ -2,6 +2,8 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 import json_server
 import bitcoin
+import trader
+
 import hashlib
 
 import ecdsa
@@ -27,53 +29,65 @@ if __name__ == '__main__':
 
     args = vars(parser.parse_args())
 
-    print (args)
-
-    i = int('9190bca67fd34203964cb5196f8152ad319aec5e9a1f868bc0193cf03305d845', 16)
-
-    key1 = ecdsa.SigningKey.from_secret_exponent(i, ecdsa.curves.SECP256k1)
-
     user_pass_string = u"http://%s:%s@%s:%s" % (args[u'user'][0], args[u'pass'][0], args[u'host'][0], args[u'port'][0])
 
     rpc = bitcoin.RPCInterface(user_pass_string, MULTIPLIER)
 
-    pub_key_sec = rpc.get_der_key_from_ecdsa_key(key1)
+    rpc.unlock_all_unspent()
 
-    # outputs = [rpc.get_pay_to_pub_key_output(pub_key_sec, 0.001 * MULTIPLIER)]
-    p2sh_script_pub_key = rpc.get_pay_to_pub_key_script_pub_key(pub_key_sec)
-    outputs = [rpc.get_pay_to_p2sh_output(p2sh_script_pub_key, 0.001 * MULTIPLIER)]
+    fast_trader = trader.ChainTrader(True,
+                                     rpc, 0.001 * MULTIPLIER, 0.0001 * MULTIPLIER,
+                                     rpc, 0.0015 * MULTIPLIER, 0.0001 * MULTIPLIER)
 
-    raw_tx = rpc.pay_to(outputs, 0.0001 * MULTIPLIER)
-    # raw_tx = True
+    slow_trader = trader.ChainTrader(False,
+                                     rpc, 0.001 * MULTIPLIER, 0.0001 * MULTIPLIER,
+                                     rpc, 0.0015 * MULTIPLIER, 0.0001 * MULTIPLIER)
 
-    if not raw_tx:
-        print ("Insufficient transaction outputs to pay to outputs")
-        exit()
+    deterministic_keys = False
+    send_bail_in = True
 
-    tx_hash = bitcoin.DoubleSHA256(binascii.unhexlify(raw_tx)).hexdigest()
+    if deterministic_keys:
+        # For debug only
+        fast_trader.generate_keys(20)
+        slow_trader.generate_keys(10)
+    else:
+        fast_trader.generate_keys()
+        slow_trader.generate_keys()
 
-    # tx_hash = rpc.hex_swap(u'444ded616aa3f05af4875bc2206ebd4c24c0d3e64e27a2a3e8c3441248828ba6')
+    hash_x = slow_trader.generate_hash_x()
+    fast_trader.set_hash_x(hash_x)
 
-    inputs = [(tx_hash, 0)]
+    slow_pub_keys = slow_trader.get_public_keys()
+    fast_pub_keys = fast_trader.get_public_keys()
 
-    payment_address = rpc.get_raw_pub_key(False)
-    payment_outputs = [rpc.get_pay_to_pub_key_output(payment_address, 0.0009 * MULTIPLIER)]
+    slow_trader.set_keys(fast_pub_keys)
+    fast_trader.set_keys(slow_pub_keys)
 
-    transaction = rpc.create_raw_transaction(inputs, payment_outputs)
+    fast_bail_in = fast_trader.generate_bail_in_transaction(send_bail_in)
+    slow_bail_in = slow_trader.generate_bail_in_transaction(send_bail_in)
 
-    # raw_sig = rpc.sign_transaction_input(transaction, outputs[0][0], 0, key1)
-    raw_sig = rpc.sign_transaction_input(transaction, p2sh_script_pub_key, 0, key1)
+    if send_bail_in:
+        rpc.send_raw_transaction(slow_bail_in)
+        rpc.send_raw_transaction(fast_bail_in)
 
-    sig = rpc.get_sec_sig_from_raw_sig(raw_sig)
-    sig2 = p2sh_script_pub_key
+        fast_trader.set_bail_in_hash(slow_trader.get_bail_in_hash())
+        slow_trader.set_bail_in_hash(fast_trader.get_bail_in_hash())
+    else:
+        # Repeat for deterministic keys
+        fast_bail_in_hash = rpc.hex_swap(u'd825cb85e9891b7a9fb524835ab13d10542f2bf65ba84cb0e4edae5fe9d37ab9')
+        slow_bail_in_hash = rpc.hex_swap(u'6bf41af549e54f795bfedeb58a70e686d4da7e54520708791784b2511843aede')
+        fast_trader._force_bail_in_hashes(fast_bail_in_hash, slow_bail_in_hash)
+        slow_trader._force_bail_in_hashes(fast_bail_in_hash, slow_bail_in_hash)
 
-    transaction = rpc.add_signatures_to_raw_transaction(transaction, 0, [sig, sig2])
+    slow_trader.generate_transactions()
+    fast_trader.generate_transactions()
 
-    rpc.get_rpc().sendrawtransaction(transaction)
+    fast_sigs = fast_trader.sign_transactions()
 
-    # httpd = json_server.JSONHTTPServer('user', 'pass', (HOSTNAME, PORT), json_server.JSONHandler)
-    # try:
-    #    httpd.serve_forever()
-    # except KeyboardInterrupt:
-    #    pass
-    # httpd.server_close()
+    slow_sigs = slow_trader.sign_transactions()
+
+    x = slow_trader.send_payout(fast_sigs)
+
+    fast_trader.set_x(x)
+
+    fast_trader.send_payout(slow_sigs)

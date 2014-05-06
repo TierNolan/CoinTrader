@@ -3,8 +3,11 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import authproxy
 import binascii
 import hashlib
+import base58
+import ecdsa
 
 VARINT_LIMIT = 0xFD
+
 
 def OP_PUSH(x):
     l = len(x)
@@ -15,29 +18,36 @@ def OP_PUSH(x):
         raise Exception
     return u'%02x%s' % (l, x)
 
+
 def OP_N(x):
     if 0 <= x <= 16:
         if x == 0:
             return u'00'
         else:
-            return u'%02x' % x + 0x50
+            return u'%02x' % (x + 0x50)
     else:
         raise ValueError("OP_N out of range [0 to 16]")
+
 
 def OP_EQUAL():
         return u'87'
 
+
 def OP_EQUAL_VERIFY():
     return u'88'
+
 
 def OP_HASH160():
     return u'a9'
 
+
 def OP_CHECKSIG():
     return u'ac'
 
+
 def OP_CHECKMULTISIG():
     return u'ae'
+
 
 class DoubleSHA256(object):
     """ Class to perform double SHA256"""
@@ -114,6 +124,12 @@ class RPCInterface(object):
 
         return new_hex
 
+    def lockunspent(self, txid, index):
+        return self.__rpc.lockunspent(False, [{"txid": self.hex_swap(txid), "vout":index}])
+
+    def unlock_all_unspent(self):
+        self.__rpc.lockunspent(True)
+
     def get_inputs_hex_from_out_points(self, out_points):
         """
         Gets the hex encoded inputs section of a transaction
@@ -127,8 +143,6 @@ class RPCInterface(object):
             raise ValueError("Number of inputs exceeded maximum supported %d >= %d", (len(out_points), VARINT_LIMIT))
 
         input_hex = u'%02x' % len(out_points)
-
-        print (out_points)
 
         for out_point in out_points:
             txout_hash = out_point[0]
@@ -204,6 +218,32 @@ class RPCInterface(object):
 
         return None, None
 
+    def get_private_key(self, version=None, change=True):
+        if change:
+            address = self.__rpc.getrawchangeaddress()
+        else:
+            address = self.__rpc.getnewaddress()
+
+        private_key = self.__rpc.dumpprivkey(address)
+
+        decoded = binascii.hexlify(base58.decode(private_key))
+
+        if version:
+            if version != decoded[0:2]:
+                raise ValueError("Unexpected private key version")
+
+        compressed = decoded[-2:]
+        if compressed != u'01':
+            raise ValueError("Expected compressed bit to be set")
+
+        decoded = decoded[2:-2]
+        if len(decoded) != 64:
+            raise ValueError("Unexpected private key length")
+
+        secexp = int(decoded, 16)
+
+        return ecdsa.SigningKey.from_secret_exponent(secexp, ecdsa.curves.SECP256k1)
+
     def get_raw_pub_key(self, change=True):
         """
         Get a public key from the wallet
@@ -215,6 +255,7 @@ class RPCInterface(object):
         else:
             address = self.__rpc.getnewaddress()
         validated_address = self.__rpc.validateaddress(address)
+
         return validated_address[u'pubkey']
 
     def get_der_key_from_ecdsa_key(self, key):
@@ -296,7 +337,7 @@ class RPCInterface(object):
 
         return raw_tx
 
-    def create_pay_to(self, outputs, fee=0):
+    def create_pay_to(self, outputs, fee=0, lock=False):
         """
         Creates a transaction which pays to a set of outputs
         :param outputs: array of output tuples
@@ -313,6 +354,9 @@ class RPCInterface(object):
 
         if not out_points:
             return None
+
+        for out_point in out_points:
+            self.lockunspent(out_point[0], out_point[1])
 
         change_value = inputs_value - total_outputs - fee
 
@@ -336,13 +380,14 @@ class RPCInterface(object):
         """
         raw_tx = self.create_pay_to(outputs, fee)
         if raw_tx:
-            print (raw_tx)
             signed_tx = self.sign_transaction_by_server(raw_tx)
             if signed_tx:
-                print (signed_tx)
                 self.__rpc.sendrawtransaction(signed_tx)
                 return signed_tx
         return None
+
+    def send_raw_transaction(self, transaction):
+        self.__rpc.sendrawtransaction(transaction)
 
     def get_rpc(self):
         """
@@ -358,7 +403,9 @@ class RPCInterface(object):
         :return: hex encoded signed raw transaction or None on failure
         """
         try:
-            return self.__rpc.signrawtransaction(raw_tx)[u'hex']
+            response = self.__rpc.signrawtransaction(raw_tx)
+            if response[u'complete']:
+                return response[u'hex']
         except authproxy.JSONRPCException as e:
             pass
 
@@ -376,9 +423,13 @@ class RPCInterface(object):
         transaction = self.set_sig_script(transaction, script_pub_key, index) + u'01000000'
         transaction_bin = binascii.unhexlify(transaction)
         sig = key.sign_deterministic(transaction_bin, DoubleSHA256)
-        print ("Hashing %s" % (binascii.hexlify(transaction_bin)))
-        print ("Sig hash %s" % (binascii.hexlify(DoubleSHA256(transaction_bin).digest())))
-        return binascii.hexlify(sig)
+        sig = self.get_sec_sig_from_raw_sig(binascii.hexlify(sig))
+
+        # print ("Hashing %s" % (binascii.hexlify(transaction_bin)))
+        # print ("Sig hash %s" % (binascii.hexlify(DoubleSHA256(transaction_bin).digest())))
+        # print ("Key %s" % (self.get_der_key_from_ecdsa_key(key)))
+
+        return sig
 
     def strip_zeros(self, hex_str):
         """
@@ -388,12 +439,12 @@ class RPCInterface(object):
         """
         hex_bin = binascii.unhexlify(hex_str)
         i = 0
-        while hex_bin[i] == 0:
+        while hex_bin[i] == b"\x00":
             i += 1
 
         if ord(hex_bin[i]) >= 0x80:
             if i == 0:
-                hex_bin = b'\x00' + hex_bin
+                hex_bin = b"\x00" + hex_bin
             else:
                 hex_bin = hex_bin[i - 1:]
         else:
@@ -409,8 +460,10 @@ class RPCInterface(object):
         """
         r = sig[0:64]
         s = sig[64:128]
+
         r = self.strip_zeros(r)
         s = self.strip_zeros(s)
+
         total_length = 4 + (len(r) // 2) + (len(s) // 2)
 
         sig = u'30'
@@ -435,7 +488,6 @@ class RPCInterface(object):
         """
         sig_script = u''
         for sig in signatures:
-            print ('Sig %s' % sig)
             sig_script += OP_PUSH(sig)
         return self.set_sig_script(transaction, sig_script, index)
 
@@ -454,23 +506,24 @@ class RPCInterface(object):
         i = 10
 
         while index > 0:
-            script_len = int(transaction[i:i+2], 16)
-            if script_len > 128:
-                raise Exception
+            script_len = int(transaction[i+72:i+74], 16)
+            if script_len >= VARINT_LIMIT:
+                raise ValueError("Script length exceeds maximum for var_int %d >= %d" % (script_len, VARINT_LIMIT))
 
             i += 36 * 2
+            i += 2
             i += script_len * 2
             i += 4 * 2
 
-        if len(sig_script) > 256:
-            raise Exception
+            index -= 1
+
+        if len(sig_script) >= VARINT_LIMIT * 2:
+            raise ValueError("Script length exceeds maximum for var_int %d >= %d" % (len(sig_script) // 2, VARINT_LIMIT))
 
         sig_script = '%02x%s' % (len(sig_script) // 2, sig_script)
 
         if transaction[i+72:i+74] != u'00':
             raise ValueError("Transaction input %s is not empty" % index)
-
-        print (sig_script)
 
         return transaction[0:i + 72] + sig_script + transaction[i+74:]
 
